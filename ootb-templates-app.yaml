@@ -31,7 +31,10 @@ metadata:
   namespace: tap-install
 stringData:
   values.yaml: |
+    #@data/values
+    ---
     excluded_templates: []
+    iaas_auth: false
     label_propagation_exclusions: ["kapp.k14s.io/app", "kapp.k14s.io/association"]
     carvel_package:
       parameters:
