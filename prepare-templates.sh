@@ -5,6 +5,7 @@ YAML_DIR="./ootb-templates-test"
 
 SCRIPTING_BASE_IMAGE=$(kubectl get task -n tap-tasks kaniko-build -oyaml | yq eval '.spec.steps[0].image' -)
 KANIKO_IMAGE=$(kubectl get task -n tap-tasks kaniko-build -oyaml | yq eval '.spec.steps[2].image' -)
+CARVEL_IMAGE=$(kubectl get task -n tap-tasks carvel-package -oyaml | yq eval '.spec.steps[1].image' -)
 
 # Create a temporary file to store replacement pairs
 TEMP_FILE=$(mktemp)
@@ -14,7 +15,7 @@ TEMP_FILE=$(mktemp)
 
 echo "image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be|image: $SCRIPTING_BASE_IMAGE" >> "$TEMP_FILE"
 echo "image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/kaniko@sha256:2c817acb57d6785a18b3e02bd2319b43990e040621c926fcc556219c99a5cdee|image: $KANIKO_IMAGE" >> "$TEMP_FILE"
-echo "image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/carvel@sha256:40b6acd50cd1305a90e9a31feffb2ef30fd0141f8ac397c1a7acaad13533d5bd|image: $KANIKO_IMAGE" >> "$TEMP_FILE"
+echo "image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/carvel@sha256:40b6acd50cd1305a90e9a31feffb2ef30fd0141f8ac397c1a7acaad13533d5bd|image: $CARVEL_IMAGE" >> "$TEMP_FILE"
 
 cat $TEMP_FILE
 
