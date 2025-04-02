@@ -1,0 +1,440 @@
+#@ load("@ytt:data", "data")
+
+#@ if/end "config-writer-template" not in data.values.excluded_templates:
+---
+apiVersion: carto.run/v1alpha1
+kind: ClusterTemplate
+metadata:
+  name: config-writer-template
+spec:
+  params:
+    - name: serviceAccount
+      default: default
+    - name: registry
+      default: {}
+
+  lifecycle: tekton
+  retentionPolicy:
+    maxFailedRuns: 2
+    maxSuccessfulRuns: 2
+
+  #@ label_exclusions = "[\"" + "\", \"".join(data.values.label_propagation_exclusions) + "\"]"
+  #@yaml/text-templated-strings
+  ytt: |
+    #@ load("@ytt:data", "data")
+    #@ load("@ytt:json", "json")
+    #@ load("@ytt:base64", "base64")
+    #@ load("@ytt:assert", "assert")
+
+    #@ def merge_labels(fixed_values):
+    #@   labels = {}
+    #@   if hasattr(data.values.workload.metadata, "labels"):
+    #@     exclusions = (@= label_exclusions @)
+    #@     for k,v in dict(data.values.workload.metadata.labels).items():
+    #@       if k not in exclusions:
+    #@         labels[k] = v
+    #@       end
+    #@     end
+    #@   end
+    #@   labels.update(fixed_values)
+    #@   return labels
+    #@ end
+
+    #@ def is_monorepo_approach():
+    #@   if 'gitops_server_address' in data.values.params and 'gitops_repository_owner' in data.values.params and 'gitops_repository_name' in data.values.params:
+    #@     return True
+    #@   end
+    #@   if 'gitops_server_address' in data.values.params or 'gitops_repository_owner' in data.values.params or 'gitops_repository_name' in data.values.params:
+    #@     'gitops_server_address' in data.values.params or assert.fail("missing param: gitops_server_address")
+    #@     'gitops_repository_owner' in data.values.params or assert.fail("missing param: gitops_repository_owner")
+    #@     'gitops_repository_name' in data.values.params or assert.fail("missing param: gitops_repository_name")
+    #@   end
+    #@   return False
+    #@ end
+
+    #@ def has_git_params():
+    #@   if 'gitops_repository_prefix' in data.values.params:
+    #@     return True
+    #@   end
+    #@
+    #@   if 'gitops_repository' in data.values.params:
+    #@     return True
+    #@   end
+    #@
+    #@   return False
+    #@ end
+
+    #@ def is_gitops():
+    #@   return is_monorepo_approach() or has_git_params()
+    #@ end
+
+    #@ def param(key):
+    #@   if not key in data.values.params:
+    #@     return None
+    #@   end
+    #@   return data.values.params[key]
+    #@ end
+
+    #@ def strip_trailing_slash(some_string):
+    #@   if some_string[-1] == "/":
+    #@     return some_string[:-1]
+    #@   end
+    #@   return some_string
+    #@ end
+
+    #@ def mono_repository():
+    #@   strip_trailing_slash(data.values.params.gitops_server_address)
+    #@   if param("gitops_server_kind") == "azure":
+    #@     repository = "/".join([
+    #@       strip_trailing_slash(data.values.params.gitops_server_address),
+    #@       strip_trailing_slash(data.values.params.gitops_repository_owner),
+    #@       "_git",
+    #@       data.values.params.gitops_repository_name,
+    #@     ])
+    #@     return repository.replace(" ", "%20")
+    #@   end
+    #@
+    #@   repository =  "/".join([
+    #@     strip_trailing_slash(data.values.params.gitops_server_address),
+    #@     strip_trailing_slash(data.values.params.gitops_repository_owner),
+    #@     data.values.params.gitops_repository_name,
+    #@   ]) + ".git"
+    #@   return repository.replace(" ", "%20")
+    #@ end
+
+    #@ def git_repository():
+    #@   if is_monorepo_approach():
+    #@     return mono_repository()
+    #@   end
+    #@
+    #@   if 'gitops_repository' in data.values.params:
+    #@     return param("gitops_repository")
+    #@   end
+    #@
+    #@   prefix = param("gitops_repository_prefix")
+    #@   if param("gitops_server_kind") == "azure":
+    #@     return prefix + data.values.workload.metadata.name
+    #@   end
+    #@   return prefix + data.values.workload.metadata.name + ".git"
+    #@ end
+
+    #@ def image():
+    #@   return "/".join([
+    #@    data.values.params.registry.server,
+    #@    data.values.params.registry.repository,
+    #@    "-".join([
+    #@      data.values.workload.metadata.name,
+    #@      data.values.workload.metadata.namespace,
+    #@      "bundle",
+    #@    ])
+    #@   ]) + ":" + data.values.workload.metadata.uid
+    #@ end
+
+    #@ def ca_cert_data():
+    #@   if "ca_cert_data" not in param("registry"):
+    #@     return ""
+    #@   end
+    #@
+    #@   return param("registry")["ca_cert_data"]
+    #@ end
+
+    #@ if is_gitops():
+    ---
+    apiVersion: tekton.dev/v1beta1
+    kind: TaskRun
+    metadata:
+      generateName: #@ data.values.workload.metadata.name + "-config-writer-"
+      labels: #@ merge_labels({ "app.kubernetes.io/component": "config-writer" })
+    spec:
+      serviceAccountName: #@ data.values.params.serviceAccount
+      params:
+        - name: git_repository
+          value: #@ git_repository()
+        - name: git_branch
+          value: #@ param("gitops_branch")
+        - name: git_user_name
+          value: #@ param("gitops_user_name")
+        - name: git_user_email
+          value: #@ param("gitops_user_email")
+        - name: git_commit_message
+          value: #@ param("gitops_commit_message")
+        - name: git_files
+          value: #@ base64.encode(json.encode(data.values.config))
+        - name: git_server_address
+        #@ if param("gitops_server_address"):
+          value: #@ param("gitops_server_address")
+        #@ else:
+          value: "https://github.com"
+        #@ end
+        - name: ca_cert_data
+        #@ if param("ca_cert_data"):
+          value: #@ param("ca_cert_data")
+        #@ else:
+          value: ""
+        #@ end
+        - name: sub_path
+        #@ if is_monorepo_approach():
+          value: #@ "config/" + data.values.workload.metadata.namespace + "/" + data.values.workload.metadata.name
+        #@ else:
+          value: "config"
+        #@ end
+        - name: git_server_kind
+          value: #@ param("gitops_server_kind")
+      taskSpec:
+        stepTemplate:
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: "RuntimeDefault"
+            runAsNonRoot: true
+        steps:
+          - name: ensure-base-branch-exists
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            env:
+              - name: "HOME"
+                value: "/tekton/home/"
+            script: |
+              #!/usr/bin/env bash
+
+              hostname=$(echo $(params.git_server_address) | awk -F[/:] '{print $4}')
+              read -r -d '' ca_cert_data << EOM
+              $(params.ca_cert_data)
+              EOM
+
+              echo | gnutls-cli $hostname --verify-hostname $hostname
+              if [[ $? -ne 0 ]]; then
+
+                if [[ -z "$ca_cert_data" ]]; then
+                  >&2 echo "unable to verify certificate on git server, please verify ca_cert_data is set"
+                else
+                  echo | gnutls-cli --x509cafile=<(echo "$ca_cert_data") $hostname --verify-hostname $hostname &> /dev/null
+
+                  if [[ $? -ne 0 ]]; then
+                    >&2 echo "unable to verify git server's tls certificate against either system trust store or provided ca_cert_data"
+                  else
+                    CA_CERT_PATH=$(mktemp -d)
+                    echo "$(params.ca_cert_data)" | tee -a ${CA_CERT_PATH}/shared_custom_ca.crt > /dev/null
+                    git config --global http.sslCAinfo ${CA_CERT_PATH}/shared_custom_ca.crt
+                  fi
+                fi
+              fi
+
+              if [[ "$(params.git_server_kind)" == "azure" ]]; then
+                token=$(scm token --path $(credentials.path)/.git-credentials --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))
+                b64_token=$(printf ":%s" "$token" | base64 -w 0)
+                git config --global http.extraheader "Authorization: Basic ${b64_token}"
+              fi
+
+              set -o errexit
+              set -o pipefail
+              set -o xtrace
+
+              ssh_config_file=$(mktemp)
+
+              echo "
+              UserKnownHostsFile /tekton/creds/.ssh/known_hosts
+              Include $(credentials.path)/.ssh/config
+              " > $ssh_config_file
+
+              export GIT_SSH_COMMAND="ssh -F $ssh_config_file"
+
+              cd `mktemp -d`
+              git_repository="$(params.git_repository)"
+
+              i="0"
+
+              while [ $i -lt 5 ]; do
+                if git clone --depth 1 "$git_repository" ./repo; then
+                  break
+                fi
+                SLEEP_LENGTH=$(perl -e "print 2 ** $i * 3")
+                sleep $SLEEP_LENGTH
+                (( i++ )) || true
+              done
+
+              cd ./repo
+
+              if git ls-remote --exit-code --heads origin "$(params.git_branch)"; then
+                echo "branch exists"
+              else
+                git checkout --orphan "$(params.git_branch)"
+                git rm --cached . -r || true
+                git config user.email "$(params.git_user_email)"
+                git config user.name "$(params.git_user_name)"
+                git commit -m "Initialize branch" --allow-empty
+
+                set +o errexit
+                git push origin $(params.git_branch) 2> git-push-errors.txt
+                EXITCODE=$?
+                if [[ $EXITCODE -ne 0 ]] && ! grep 'reference already exists' git-push-errors.txt -q ; then
+                  exit 1
+                fi
+              fi
+          - name: git-clone-and-push
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            env:
+              - name: "HOME"
+                value: "/tekton/home/"
+            script: |
+              #!/usr/bin/env bash
+
+              hostname=$(echo $(params.git_server_address) | awk -F[/:] '{print $4}')
+              read -r -d '' ca_cert_data << EOM
+              $(params.ca_cert_data)
+              EOM
+
+              echo | gnutls-cli $hostname --verify-hostname $hostname &> /dev/null
+              if [[ $? -ne 0 ]]; then
+
+                if [[ -z "$ca_cert_data" ]]; then
+                  >&2 echo "unable to verify certificate on git server, please verify ca_cert_data is set"
+                else
+                  echo | gnutls-cli --x509cafile=<(echo "$ca_cert_data") $hostname --verify-hostname $hostname &> /dev/null
+
+                  if [[ $? -ne 0 ]]; then
+                    >&2 echo "unable to verify git server's tls certificate against either system trust store or provided ca_cert_data"
+                  else
+                    CA_CERT_PATH=$(mktemp -d)
+                    echo "$(params.ca_cert_data)" | tee -a ${CA_CERT_PATH}/shared_custom_ca.crt > /dev/null
+                    git config --global http.sslCAinfo ${CA_CERT_PATH}/shared_custom_ca.crt
+                  fi
+                fi
+              fi
+
+              if [[ "$(params.git_server_kind)" == "azure" ]]; then
+                token=$(scm token --path $(credentials.path)/.git-credentials --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))
+                b64_token=$(printf ":%s" "$token" | base64 -w 0)
+                git config --global http.extraheader "Authorization: Basic ${b64_token}"
+              fi
+
+              set -o errexit
+              set -o xtrace
+
+              ssh_config_file=$(mktemp)
+
+              echo "
+              UserKnownHostsFile /tekton/creds/.ssh/known_hosts
+              Include $(credentials.path)/.ssh/config
+              " > $ssh_config_file
+
+              export GIT_SSH_COMMAND="ssh -F $ssh_config_file"
+
+              cd `mktemp -d`
+
+              if git clone --depth 1 -b "$(params.git_branch)" "$(params.git_repository)" ./repo; then
+                cd ./repo
+              else
+                git clone --depth 1 "$(params.git_repository)" ./repo
+                cd ./repo
+                git checkout -b "$(params.git_branch)"
+              fi
+
+              git config user.email "$(params.git_user_email)"
+              git config user.name "$(params.git_user_name)"
+
+              mkdir -p $(params.sub_path) && rm -rf $(params.sub_path)/*
+              cd $(params.sub_path)
+
+              echo '$(params.git_files)' | base64 --decode > files.json
+              eval "$(cat files.json | jq -r 'to_entries | .[] | @sh "mkdir -p $(dirname \(.key)) && echo \(.value) > \(.key)"')"
+
+              rm files.json
+              git add .
+
+              if git diff --cached --exit-code; then
+                echo "Nothing to commit"
+                exit 0
+              fi
+
+              git commit -m "$(params.git_commit_message)"
+
+              set +o errexit
+              git push origin $(params.git_branch) && exit 0
+
+              echo "git push failed, retrying with exponential backoff"
+              PUSH_ATTEMPTS=0
+
+              MAX_RANDOM_VAL=32767
+              OFFSET_SEED=$(perl -e "print $RANDOM / $MAX_RANDOM_VAL + 2")
+              while [ $PUSH_ATTEMPTS -le 5 ]; do
+                SLEEP_LENGTH=$(perl -e "print $OFFSET_SEED ** $PUSH_ATTEMPTS * 15")
+                sleep $SLEEP_LENGTH
+                git remote prune origin
+                git gc --prune=now
+                git fetch origin
+                git rebase "origin/$(params.git_branch)"
+                git push origin $(params.git_branch) && exit 0
+                (( PUSH_ATTEMPTS++ ))
+              done
+
+              echo "git push failed after $PUSH_ATTEMPTS attempts"
+              exit 1
+
+    #@ else:
+    ---
+    apiVersion: tekton.dev/v1beta1
+    kind: TaskRun
+    metadata:
+      generateName: #@ data.values.workload.metadata.name + "-config-writer-"
+      labels: #@ merge_labels({ "app.kubernetes.io/component": "config-writer" })
+    spec:
+      serviceAccountName: #@ data.values.params.serviceAccount
+      params:
+        - name: files
+          value: #@ base64.encode(json.encode(data.values.config))
+        - name: bundle
+          value: #@ image()
+        - name: ca_cert_data
+          value: #@ ca_cert_data()
+      taskSpec:
+        stepTemplate:
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: "RuntimeDefault"
+            runAsNonRoot: true
+        steps:
+          - name: main
+            env:
+              - name: "DOCKER_CONFIG"
+                value: "/tekton/home/.docker/"
+              - name: "HOME"
+                value: "/tekton/home/"
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            script: |-
+              #!/usr/bin/env bash
+
+              set -o errexit
+              set -o pipefail
+              set -o xtrace
+
+              cd `mktemp -d`
+
+              echo -e "$(params.files)" | base64 --decode > files.json
+              eval "$(cat files.json | jq -r 'to_entries | .[] | @sh "mkdir -p $(dirname \(.key)) && echo \(.value) > \(.key)"')"
+
+              mkdir -p .imgpkg
+              echo "---
+              apiVersion: imgpkg.carvel.dev/v1alpha1
+              kind: ImagesLock" > ./.imgpkg/images.yml
+
+              imgpkg_params=""
+              if [[ ! -z "$(params.ca_cert_data)" ]]; then
+                certs_dir=$(mktemp -d)
+                echo "$(params.ca_cert_data)" > $certs_dir/cert
+                imgpkg_params="--registry-ca-cert-path=$certs_dir/cert"
+              fi
+
+              export IMGPKG_ENABLE_IAAS_AUTH=(@= str(data.values.iaas_auth).lower() @)
+              imgpkg push $imgpkg_params -b $(params.bundle) -f .
+
+
+    #@ end

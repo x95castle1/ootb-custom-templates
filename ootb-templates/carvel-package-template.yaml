@@ -1,0 +1,372 @@
+#@ load("@ytt:data", "data")
+#@ load("@ytt:yaml", "yaml")
+
+#@ if/end "carvel-package" not in data.values.excluded_templates:
+---
+apiVersion: carto.run/v1alpha1
+kind: ClusterConfigTemplate
+metadata:
+  name: carvel-package
+spec:
+  params:
+    - name: serviceAccount
+      default: default
+    - name: registry
+      default: {}
+    - name: carvel_package_parameters
+      default: #@ yaml.encode(data.values.carvel_package.parameters)
+    - name: carvel_package_openapiv3_enabled
+      default: true
+  configPath: .status.taskResults[?(@.name=="carvel_package")].value
+  lifecycle: tekton
+  retentionPolicy:
+    maxFailedRuns: 2
+    maxSuccessfulRuns: 2
+
+  #@ label_exclusions = "[\"" + "\", \"".join(data.values.label_propagation_exclusions) + "\"]"
+  #@yaml/text-templated-strings
+  ytt: |
+    #@ load("@ytt:data", "data")
+    #@ load("@ytt:json", "json")
+    #@ load("@ytt:base64", "base64")
+    #@ load("@ytt:assert", "assert")
+    #@ load("@ytt:regexp", "regexp")
+    #@ load("@ytt:yaml", "yaml")
+
+    #@ def merge_labels(fixed_values):
+    #@   labels = {}
+    #@   if hasattr(data.values.workload.metadata, "labels"):
+    #@     exclusions = (@= label_exclusions @)
+    #@     for k,v in dict(data.values.workload.metadata.labels).items():
+    #@       if k not in exclusions:
+    #@         labels[k] = v
+    #@       end
+    #@     end
+    #@   end
+    #@   labels.update(fixed_values)
+    #@   return labels
+    #@ end
+
+    #@ def package_labels():
+    #@   label_name = "app.kubernetes.io/part-of"
+    #@   label_value = data.values.workload.metadata.name
+    #@
+    #@   if hasattr(data.values.workload.metadata, "labels"):
+    #@     for k,v in dict(data.values.workload.metadata.labels).items():
+    #@       if k == label_name:
+    #@         label_value = v
+    #@       end
+    #@     end
+    #@   end
+    #@   return { label_name: label_value }
+    #@ end
+
+    #@ def param(key):
+    #@   if not key in data.values.params:
+    #@     return None
+    #@   end
+    #@   return data.values.params[key]
+    #@ end
+
+    #@ def image():
+    #@   return "/".join([
+    #@    data.values.params.registry.server,
+    #@    data.values.params.registry.repository,
+    #@    "-".join([
+    #@      data.values.workload.metadata.name,
+    #@      data.values.workload.metadata.namespace,
+    #@      "bundle",
+    #@    ])
+    #@   ]) + ":" + data.values.workload.metadata.uid
+    #@ end
+
+    #@ def ref_name():
+    #@   suffix = param("carvel_package_name_suffix")
+    #@   suffix or assert.fail("missing carvel_package_name_suffix")
+    #@   name = "{}.{}.{}".format(
+    #@     data.values.workload.metadata.name,
+    #@     data.values.workload.metadata.namespace,
+    #@     suffix,
+    #@   )
+    #@   assert_is_valid_carvel_package_name(name)
+    #@   return name
+    #@ end
+
+    #@ def assert_is_valid_carvel_package_name(subdomain):
+    #@   # the subdomain given must be a valid DNS subdomain (RFC 1123) and have at least 3 segments
+    #@   domain_format_max_length = 253
+    #@   domain_format_regex = "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+    #@   if len(subdomain) > domain_format_max_length:
+    #@     assert.fail("Carvel Package subdomain is invalid, exceeds max length of 253 characters")
+    #@   elif not regexp.match(domain_format_regex, subdomain):
+    #@     assert.fail("Carvel package subdomain is invalid, did not match regex {}".format(domain_format_regex))
+    #@   elif len(subdomain.split(".")) < 3:
+    #@     assert.fail("Carvel package subdomain is invalid, must have at least 3 segments")
+    #@   end
+    #@ end
+
+    #@ def ca_cert_data():
+    #@   if "ca_cert_data" not in param("registry"):
+    #@     return ""
+    #@   end
+    #@
+    #@   return param("registry")["ca_cert_data"]
+    #@ end
+
+    #@ def calculate_match_score(selector):
+    #@   selector or assert.fail("no selector provided")
+    #@   matchLabels = selector.get("matchLabels")
+    #@   matchLabels or assert.fail("selector does not have matchLabels")
+    #@
+    #@   match_score = 0
+    #@   is_match = True
+    #@   for label in matchLabels:
+    #@     label_value = matchLabels[label]
+    #@     if hasattr(data.values.workload.metadata.labels, label) and getattr(data.values.workload.metadata.labels, label) == label_value:
+    #@       match_score += 1
+    #@     else:
+    #@       is_match = False
+    #@       match_score = -1
+    #@       break
+    #@     end
+    #@   end
+    #@   return [is_match, match_score]
+    #@ end
+
+    #@ def matching_schema():
+    #@   parameters = yaml.decode(data.values.params.carvel_package_parameters)
+    #@   parameters or assert.fail("no carvel package parameters provided")
+    #@
+    #@   match_scores = []
+    #@   for i in range(len(parameters)):
+    #@     schema = parameters[i]
+    #@     selector = schema.get("selector")
+    #@     selector or assert.fail("schema does not provide a selector")
+    #@     match_scores.append(calculate_match_score(selector))
+    #@   end
+    #@
+    #@   matches = []
+    #@   for i in range(len(match_scores)):
+    #@     is_match, match_score = match_scores[i]
+    #@     if is_match:
+    #@       matches.append([parameters[i], match_score])
+    #@     end
+    #@   end
+    #@
+    #@   if len(matches) == 0:
+    #@     assert.fail("no matching selectors")
+    #@   elif len(matches) > 1:
+    #@     assert.fail("more than one matching selector")
+    #@   end
+    #@
+    #@   return matches[0][0]
+    #@ end
+
+    #@ def carvel_package_schema():
+    #@   return matching_schema().get("schema")
+    #@ end
+
+    #@ def carvel_package_overlays():
+    #@   return matching_schema().get("overlays")
+    #@ end
+
+    ---
+    apiVersion: tekton.dev/v1beta1
+    kind: TaskRun
+    metadata:
+      generateName: #@ data.values.workload.metadata.name + "-carvel-package-"
+      labels: #@ merge_labels({ "app.kubernetes.io/component": "carvel-package" })
+    spec:
+      serviceAccountName: #@ data.values.params.serviceAccount
+      params:
+        - name: files
+          value: #@ base64.encode(json.encode(data.values.config))
+        - name: bundle
+          value: #@ image()
+        - name: ca_cert_data
+          value: #@ ca_cert_data()
+        - name: ref_name
+          value: #@ ref_name()
+        - name: workload_name
+          value: #@ data.values.workload.metadata.name
+        - name: git_commit
+          value: ""
+        - name: carvel_package_schema
+          value: #@ base64.encode(carvel_package_schema())
+        - name: carvel_package_overlays
+          value: #@ base64.encode(carvel_package_overlays())
+        - name: carvel_package_openapiv3_enabled
+          value: #@ param("carvel_package_openapiv3_enabled")
+        - name: carvel_package_labels
+          value: #@ base64.encode(yaml.encode(package_labels()))
+      workspaces:
+      - name: shared-package-variables
+        emptyDir: {}
+      taskSpec:
+        results:
+          - name: carvel_package
+            description: Carvel distributable packages that enables users to install on a different cluster.
+        stepTemplate:
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: "RuntimeDefault"
+            runAsNonRoot: true
+        steps:
+          - name: build-imgpkg-bundle
+            env:
+              - name: "DOCKER_CONFIG"
+                value: "/tekton/home/.docker/"
+              - name: "HOME"
+                value: "/tekton/home/"
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            script: |-
+              #!/usr/bin/env bash
+
+              set -o errexit
+              set -o pipefail
+              set -o xtrace
+
+              cd `mktemp -d`
+
+              #############################################
+              #    build imgpkg bundle, openapiv3 spec    #
+              #############################################
+
+              echo -e "$(params.files)" | base64 --decode > files.json
+              eval "$(cat files.json | jq -r 'to_entries | .[] | @sh "mkdir -p $(dirname \(.key)) && echo \(.value) > \(.key)"')"
+
+              echo -e "$(params.carvel_package_schema)" | base64 --decode | tee ./values.yml
+              echo -e "$(params.carvel_package_overlays)" | base64 --decode | tee ./overlays.yml
+
+              if [[ "$(params.carvel_package_openapiv3_enabled)" == "true" ]]; then
+                ytt -f ./values.yml --data-values-schema-inspect -o openapi-v3 > $(workspaces.shared-package-variables.path)/schema-openapi.yml
+              fi
+
+              mkdir -p .imgpkg
+              kbld -f . --imgpkg-lock-output ".imgpkg/images.yml"
+
+              imgpkg_params=""
+              if [[ ! -z "$(params.ca_cert_data)" ]]; then
+                certs_dir=$(mktemp -d)
+                echo "$(params.ca_cert_data)" > $certs_dir/cert
+                imgpkg_params="--registry-ca-cert-path=$certs_dir/cert"
+              fi
+
+              export IMGPKG_ENABLE_IAAS_AUTH=(@= str(data.values.iaas_auth).lower() @)
+              imgpkg push $imgpkg_params -b $(params.bundle) -f . --lock-output "package.lock"
+              imgpkg_bundle="$(awk -F"image: " '{if ($2) print $2;}' package.lock)"
+
+              echo "$imgpkg_bundle" > $(workspaces.shared-package-variables.path)/imgpkg_bundle_file
+
+          - name: package-version
+            env:
+              - name: "DOCKER_CONFIG"
+                value: "/tekton/home/.docker/"
+              - name: "HOME"
+                value: "/tekton/home/"
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/carvel@sha256:40b6acd50cd1305a90e9a31feffb2ef30fd0141f8ac397c1a7acaad13533d5bd
+            script: |-
+              #!/usr/bin/env bash
+
+              set -o errexit
+              set -o pipefail
+              set -o xtrace
+
+              cd `mktemp -d`
+
+              echo -e "$(params.files)" | base64 --decode > files.json
+              imagename="$(cat files.json | jq -r 'to_entries | .[].value' | sed -n 's/.*image:[[:space:]]*\([^[:space:]]*\).*/\1/p')"
+
+              git_commit=""
+              if [[ ! -z "$imagename" ]]; then
+                revision="$(krane --insecure config "$imagename" | jq -r '.config.Labels["org.opencontainers.image.revision"]')"
+                regex="^([a-zA-Z0-9\/_-]+)(\@sha1:)?([0-9a-f]{40})$"
+                if [[ "$revision" =~ $regex ]]; then
+                  git_commit="${BASH_REMATCH[3]:0:7}"
+                fi
+              fi
+
+              current_date="$(date "+%Y%m%d%H%M%S.0.0")"
+
+              if [[ -z "${git_commit}" ]]; then
+                carvel_package_version="${current_date}"
+              else
+                carvel_package_version="${current_date}+build.${git_commit}"
+              fi
+
+              echo "${current_date}.yml" > $(workspaces.shared-package-variables.path)/carvel_package_filename_file
+              echo "$carvel_package_version" > $(workspaces.shared-package-variables.path)/carvel_package_version_file
+
+          - name: build-carvel-package
+            env:
+              - name: "DOCKER_CONFIG"
+                value: "/tekton/home/.docker/"
+              - name: "HOME"
+                value: "/tekton/home/"
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            script: |-
+              #!/usr/bin/env bash
+
+              set -o errexit
+              set -o pipefail
+              set -o xtrace
+
+              cd `mktemp -d`
+
+              ##############################
+              #    build carvel package    #
+              ##############################
+
+              carvel_package_version="$(cat $(workspaces.shared-package-variables.path)/carvel_package_version_file)"
+              imgpkg_bundle="$(cat $(workspaces.shared-package-variables.path)/imgpkg_bundle_file)"
+              carvel_package_filename="$(cat $(workspaces.shared-package-variables.path)/carvel_package_filename_file)"
+
+              echo -e "$(params.carvel_package_labels)" | base64 --decode | tee ./labels.yml
+
+              cat <<EOF > ./package-template.yaml
+              #@ load("@ytt:data", "data")
+              #@ load("@ytt:yaml", "yaml")
+
+              #@ def package():
+              apiVersion: data.packaging.carvel.dev/v1alpha1
+              kind: Package
+              metadata:
+                name: $(params.ref_name).${carvel_package_version}
+                labels: #@ yaml.decode(data.values.labels)
+              spec:
+                refName: $(params.ref_name)
+                version: ${carvel_package_version}
+                template:
+                  spec:
+                    fetch:
+                    - imgpkgBundle:
+                        image: ${imgpkg_bundle}
+                    template:
+                    - ytt:
+                        paths:
+                        - "."
+                    - kbld:
+                        paths:
+                        - ".imgpkg/images.yml"
+                        - "-"
+                    deploy:
+                    - kapp: {}
+                #@ if "openapi" in data.values:
+                valuesSchema:
+                  openAPIv3: #@ yaml.decode(data.values.openapi)["components"]["schemas"]["dataValues"]
+                #@ end
+              #@ end
+
+              ${carvel_package_filename}: #@ yaml.encode(package())
+              EOF
+
+              if [[ "$(params.carvel_package_openapiv3_enabled)" == "true" ]]; then
+                ytt -f ./package-template.yaml --data-value labels="$(cat ./labels.yml)" --data-value openapi="$(cat $(workspaces.shared-package-variables.path)/schema-openapi.yml)" | tee $(results.carvel_package.path)
+              else
+                ytt -f ./package-template.yaml --data-value labels="$(cat ./labels.yml)" | tee $(results.carvel_package.path)
+              fi

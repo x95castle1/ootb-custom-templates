@@ -1,0 +1,491 @@
+#@ load("@ytt:data", "data")
+
+#@ if/end "package-config-writer-and-pull-requester-template" not in data.values.excluded_templates:
+---
+apiVersion: carto.run/v1alpha1
+kind: ClusterTemplate
+metadata:
+  name: package-config-writer-and-pull-requester-template
+spec:
+  lifecycle: tekton
+  retentionPolicy:
+    maxFailedRuns: 2
+    maxSuccessfulRuns: 2
+
+  #@ label_exclusions = "[\"" + "\", \"".join(data.values.label_propagation_exclusions) + "\"]"
+  #@yaml/text-templated-strings
+  ytt: |
+    #@ load("@ytt:data", "data")
+    #@ load("@ytt:json", "json")
+    #@ load("@ytt:base64", "base64")
+    #@ load("@ytt:yaml", "yaml")
+    #@ load("@ytt:assert", "assert")
+    #@ load("@ytt:regexp", "regexp")
+
+    #@ def merge_labels(fixed_values):
+    #@   labels = {}
+    #@   if hasattr(data.values.workload.metadata, "labels"):
+    #@     exclusions = (@= label_exclusions @)
+    #@     for k,v in dict(data.values.workload.metadata.labels).items():
+    #@       if k not in exclusions:
+    #@         labels[k] = v
+    #@       end
+    #@     end
+    #@   end
+    #@   labels.update(fixed_values)
+    #@   return labels
+    #@ end
+
+    #@ def param(key):
+    #@   if not key in data.values.params:
+    #@     return None
+    #@   end
+    #@   return data.values.params[key]
+    #@ end
+
+    #@ def ref_name():
+    #@   suffix = param("carvel_package_name_suffix")
+    #@   suffix or assert.fail("missing carvel_package_name_suffix")
+    #@   name = "{}.{}.{}".format(
+    #@     data.values.workload.metadata.name,
+    #@     data.values.workload.metadata.namespace,
+    #@     suffix,
+    #@   )
+    #@   assert_is_valid_carvel_package_name(name)
+    #@   return name
+    #@ end
+
+    #@ def assert_is_valid_carvel_package_name(subdomain):
+    #@   # the subdomain given must be a valid DNS subdomain (RFC 1123) and have at least 3 segments
+    #@   domain_format_max_length = 253
+    #@   domain_format_regex = "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+    #@   if len(subdomain) > domain_format_max_length:
+    #@     assert.fail("Carvel Package subdomain is invalid, exceeds max length of 253 characters")
+    #@   elif not regexp.match(domain_format_regex, subdomain):
+    #@     assert.fail("Carvel package subdomain is invalid, did not match regex {}".format(domain_format_regex))
+    #@   elif len(subdomain.split(".")) < 3:
+    #@     assert.fail("Carvel package subdomain is invalid, must have at least 3 segments")
+    #@   end
+    #@ end
+
+    #@ def sub_path():
+    #@   subpath = "{}/packages/".format(ref_name())
+    #@   carvel_package_gitops_subpath = param("carvel_package_gitops_subpath")
+    #@   if carvel_package_gitops_subpath:
+    #@     subpath = "{}/{}".format(carvel_package_gitops_subpath, subpath)
+    #@   end
+    #@   return subpath
+    #@ end
+
+    ---
+    apiVersion: tekton.dev/v1beta1
+    kind: TaskRun
+    metadata:
+      generateName: #@ data.values.workload.metadata.name + "-pkg-cfg-writer-pr-"
+      labels: #@ merge_labels({ "app.kubernetes.io/component": "package-config-writer-pull-requester" })
+    spec:
+      serviceAccountName: #@ data.values.params.serviceAccount
+      workspaces:
+        - name: ws
+          emptyDir: { }
+      params:
+        - name: git_server_kind
+          value: #@ data.values.params.gitops_server_kind
+        - name: git_server_address
+          value: #@ data.values.params.gitops_server_address
+        - name: repository_owner
+          value: #@ data.values.params.gitops_repository_owner
+        - name: repository_name
+          value: #@ data.values.params.gitops_repository_name
+        - name: commit_branch
+          value: #@ data.values.params.gitops_commit_branch
+        - name: pull_request_title
+          value: #@ data.values.params.gitops_pull_request_title
+        - name: pull_request_body
+          value: #@ data.values.params.gitops_pull_request_body
+        - name: base_branch
+          value: #@ data.values.params.gitops_branch
+        - name: git_user_name
+          value: #@ data.values.params.gitops_user_name
+        - name: git_user_email
+          value: #@ data.values.params.gitops_user_email
+        - name: git_commit_message
+          value: #@ data.values.params.gitops_commit_message
+        - name: git_files
+          value: #@ base64.encode(json.encode(yaml.decode(data.values.config)))
+        - name: sub_path
+          value: #@ sub_path()
+        - name: ca_cert_data
+          value: #@ data.values.params.ca_cert_data
+      taskSpec:
+        stepTemplate:
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: "RuntimeDefault"
+            runAsNonRoot: true
+        results:
+          - name: pr-url
+            description: The url of the successfully created pull request
+        workspaces:
+          - name: ws
+            mountPath: /workspaces/ws
+        steps:
+          - name: ensure-base-branch-exists
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            env:
+              - name: "HOME"
+                value: "/tekton/home/"
+            script: |
+              #!/usr/bin/env bash
+
+              hostname=$(echo $(params.git_server_address) | awk -F[/:] '{print $4}')
+              repo_owner=$(echo -n "$(params.repository_owner)" | sed 's/ /%20/g')
+              repo_name=$(echo -n "$(params.repository_name)" | sed 's/ /%20/g')
+              read -r -d '' ca_cert_data << EOM
+              $(params.ca_cert_data)
+              EOM
+
+              echo | gnutls-cli $hostname --verify-hostname $hostname &> /dev/null
+              if [[ $? -ne 0 ]]; then
+
+                if [[ -z "$ca_cert_data" ]]; then
+                  >&2 echo "unable to verify certificate on git server, please verify ca_cert_data is set"
+                else
+                  echo | gnutls-cli --x509cafile=<(echo "$ca_cert_data") $hostname --verify-hostname $hostname &> /dev/null
+
+                  if [[ $? -ne 0 ]]; then
+                    >&2 echo "unable to verify git server's tls certificate against either system trust store or provided ca_cert_data"
+                  else
+                    CA_CERT_PATH=$(mktemp -d)
+                    echo "$(params.ca_cert_data)" | tee -a ${CA_CERT_PATH}/shared_custom_ca.crt > /dev/null
+                    git config --global http.sslCAinfo ${CA_CERT_PATH}/shared_custom_ca.crt
+                  fi
+                fi
+              fi
+
+              ensure_branch () {
+                create_branch="$1"
+
+                if git ls-remote --exit-code --heads origin "$create_branch"; then
+                  echo "branch exists"
+                  return 0
+                fi
+
+                git checkout --orphan "$create_branch"
+                git rm --cached . -r || true
+                git commit -m "Initialize base branch" --allow-empty
+
+                set +o errexit
+                git push origin $create_branch 2> git-push-errors.txt
+                EXITCODE=$?
+                if [[ $EXITCODE -ne 0 ]]; then
+                  if ! git cherry origin/"$create_branch" "$create_branch" | grep -Eq "^\+ [a-zA-Z0-9]{40}$"; then
+                    echo "Branch exists on origin and all local commits are already in origin"
+                    return 0
+                  fi
+                  cat git-push-errors.txt
+                  exit 1
+                fi
+              }
+
+              if [[ "$(params.git_server_kind)" == "azure" && "$(params.git_server_address)" != "https://dev.azure.com" ]]; then
+                token=$(scm token --path $(credentials.path)/.git-credentials --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))
+                b64_token=$(printf ":%s" "$token" | base64 -w 0)
+                git config --global http.extraheader "Authorization: Basic ${b64_token}"
+              fi
+
+              set -o errexit
+              set -o pipefail
+              set -o xtrace
+
+              cd `mktemp -d`
+
+              git_repository="$(scm url --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))"
+
+              i="0"
+              while [ $i -lt 5 ]; do
+                if git clone --depth 1 "$git_repository" ./repo; then
+                  break
+                fi
+                SLEEP_LENGTH=$(perl -e "print 2 ** $i * 3")
+                sleep $SLEEP_LENGTH
+                (( i++ )) || true
+              done
+
+              cd ./repo
+
+              git config --global user.email "$(params.git_user_email)"
+              git config --global user.name "$(params.git_user_name)"
+
+              ensure_branch "$(params.base_branch)"
+
+          - name: ensure-commit-branch-exists
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            env:
+              - name: "HOME"
+                value: "/tekton/home/"
+            script: |
+              #!/usr/bin/env bash
+
+              hostname=$(echo $(params.git_server_address) | awk -F[/:] '{print $4}')
+              repo_owner=$(echo -n "$(params.repository_owner)" | sed 's/ /%20/g')
+              repo_name=$(echo -n "$(params.repository_name)" | sed 's/ /%20/g')
+              read -r -d '' ca_cert_data << EOM
+              $(params.ca_cert_data)
+              EOM
+
+              echo | gnutls-cli $hostname --verify-hostname $hostname &> /dev/null
+              if [[ $? -ne 0 ]]; then
+
+                if [[ -z "$ca_cert_data" ]]; then
+                  >&2 echo "unable to verify certificate on git server, please verify ca_cert_data is set"
+                else
+                  echo | gnutls-cli --x509cafile=<(echo "$ca_cert_data") $hostname --verify-hostname $hostname &> /dev/null
+
+                  if [[ $? -ne 0 ]]; then
+                    >&2 echo "unable to verify git server's tls certificate against either system trust store or provided ca_cert_data"
+                  else
+                    CA_CERT_PATH=$(mktemp -d)
+                    echo "$(params.ca_cert_data)" | tee -a ${CA_CERT_PATH}/shared_custom_ca.crt > /dev/null
+                    git config --global http.sslCAinfo ${CA_CERT_PATH}/shared_custom_ca.crt
+                  fi
+                fi
+              fi
+
+              ensure_branch () {
+                create_branch="$1"
+
+                if git ls-remote --exit-code --heads origin "$create_branch"; then
+                  echo "branch exists"
+                  return 0
+                fi
+
+                git checkout -b "$create_branch"
+
+                set +o errexit
+                git push origin $create_branch 2> git-push-errors.txt
+                EXITCODE=$?
+                if [[ $EXITCODE -ne 0 ]]; then
+                  if ! git cherry origin/"$create_branch" "$create_branch" | grep -Eq "^\+ [a-zA-Z0-9]{40}$"; then
+                    echo "Branch exists on origin and all local commits are already in origin"
+                    return 0
+                  fi
+                  cat git-push-errors.txt
+                  exit 1
+                fi
+              }
+
+              if [[ "$(params.git_server_kind)" == "azure" && "$(params.git_server_address)" != "https://dev.azure.com" ]]; then
+                token=$(scm token --path $(credentials.path)/.git-credentials --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))
+                b64_token=$(printf ":%s" "$token" | base64 -w 0)
+                git config --global http.extraheader "Authorization: Basic ${b64_token}"
+              fi
+
+              set -o errexit
+              set -o pipefail
+              set -o xtrace
+
+              cd `mktemp -d`
+
+              git_repository="$(scm url --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))"
+
+              i="0"
+              while [ $i -lt 5 ]; do
+                if git clone --depth 1 "$git_repository" ./repo; then
+                  break
+                fi
+                SLEEP_LENGTH=$(perl -e "print 2 ** $i * 3")
+                sleep $SLEEP_LENGTH
+                (( i++ )) || true
+              done
+
+              cd ./repo
+
+              git config --global user.email "$(params.git_user_email)"
+              git config --global user.name "$(params.git_user_name)"
+
+              git remote set-branches origin "$(params.base_branch)"
+              git fetch --depth=1
+              git checkout "$(params.base_branch)"
+
+              commit_branch="$(params.commit_branch)"
+              if [[ -z "$commit_branch" ]]; then
+                commit_branch=$(date +%s | base64 -w 0)
+              fi
+
+              echo "$commit_branch" > /workspaces/ws/commit_branch
+
+              ensure_branch "$commit_branch"
+
+          - name: git-clone-and-push
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            env:
+              - name: "HOME"
+                value: "/tekton/home/"
+            script: |
+              #!/usr/bin/env bash
+
+              hostname=$(echo $(params.git_server_address) | awk -F[/:] '{print $4}')
+              repo_owner=$(echo -n "$(params.repository_owner)" | sed 's/ /%20/g')
+              repo_name=$(echo -n "$(params.repository_name)" | sed 's/ /%20/g')
+              read -r -d '' ca_cert_data << EOM
+              $(params.ca_cert_data)
+              EOM
+
+              echo | gnutls-cli $hostname --verify-hostname $hostname &> /dev/null
+              if [[ $? -ne 0 ]]; then
+
+                if [[ -z "$ca_cert_data" ]]; then
+                  >&2 echo "unable to verify certificate on git server, please verify ca_cert_data is set"
+                else
+                  echo | gnutls-cli --x509cafile=<(echo "$ca_cert_data") $hostname --verify-hostname $hostname &> /dev/null
+
+                  if [[ $? -ne 0 ]]; then
+                    >&2 echo "unable to verify git server's tls certificate against either system trust store or provided ca_cert_data"
+                  else
+                    CA_CERT_PATH=$(mktemp -d)
+                    echo "$(params.ca_cert_data)" | tee -a ${CA_CERT_PATH}/shared_custom_ca.crt > /dev/null
+                    git config --global http.sslCAinfo ${CA_CERT_PATH}/shared_custom_ca.crt
+                  fi
+                fi
+              fi
+
+              if [[ "$(params.git_server_kind)" == "azure" && "$(params.git_server_address)" != "https://dev.azure.com" ]]; then
+                token=$(scm token --path $(credentials.path)/.git-credentials --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))
+                b64_token=$(printf ":%s" "$token" | base64 -w 0)
+                git config --global http.extraheader "Authorization: Basic ${b64_token}"
+              fi
+
+              set -o errexit
+              set -o xtrace
+
+              cd `mktemp -d`
+
+              commit_branch=$(cat /workspaces/ws/commit_branch | tr -d '\n')
+
+              git_repository="$(scm url --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))"
+
+              i="0"
+              while [ $i -lt 5 ]; do
+                if git clone --depth 1 -b "$commit_branch" "$git_repository" ./repo; then
+                  break
+                fi
+                SLEEP_LENGTH=$(perl -e "print 2 ** $i * 3")
+                sleep $SLEEP_LENGTH
+                (( i++ )) || true
+              done
+
+              cd ./repo
+
+              git config --global user.email "$(params.git_user_email)"
+              git config --global user.name "$(params.git_user_name)"
+
+              mkdir -p $(params.sub_path) && rm -rf $(params.sub_path)/*
+              cd $(params.sub_path)
+
+              echo '$(params.git_files)' | base64 --decode > files.json
+              eval "$(cat files.json | jq -r 'to_entries | .[] | @sh "mkdir -p $(dirname \(.key)) && echo \(.value) > \(.key)"')"
+
+              rm files.json
+              git add .
+
+              if git diff --cached --exit-code; then
+                git remote set-branches origin "$(params.base_branch)"
+                git fetch --depth=1
+                if git diff "origin/$(params.base_branch)" --exit-code; then
+                  touch /workspaces/ws/do-not-open-pr
+                fi
+
+                echo "Nothing to commit"
+                exit 0
+              fi
+
+              git commit -m "$(params.git_commit_message)"
+
+              set +o errexit
+              git push origin $commit_branch && exit 0
+
+              echo "git push failed, retrying with exponential backoff"
+              PUSH_ATTEMPTS=0
+
+              MAX_RANDOM_VAL=32767
+              OFFSET_SEED=$(perl -e "print $RANDOM / $MAX_RANDOM_VAL + 2")
+              while [ $PUSH_ATTEMPTS -le 5 ]; do
+                SLEEP_LENGTH=$(perl -e "print $OFFSET_SEED ** $PUSH_ATTEMPTS * 15")
+                sleep $SLEEP_LENGTH
+                git remote prune origin
+                git gc --prune=now
+                git fetch origin
+                git rebase "origin/$commit_branch"
+                git push origin $commit_branch && exit 0
+                (( PUSH_ATTEMPTS++ ))
+              done
+
+              echo "git push failed after $PUSH_ATTEMPTS attempts"
+              exit 1
+
+          - name: open-pr
+            image: supply-chain-docker-prod-local.usw1.packages.broadcom.com/packages/catalog-v1/ootb-templates/scripting-base@sha256:89c74ab6c164fb57b45dc53bd4d2cd43ea145754fb795f37d4679109707e41be
+            script: |
+              #!/usr/bin/env bash
+
+              if [[ -f /workspaces/ws/do-not-open-pr ]]; then
+                echo "commit branch is at the same SHA as the base branch; no pull request opened"
+                exit 0
+              fi
+
+              hostname=$(echo $(params.git_server_address) | awk -F[/:] '{print $4}')
+              repo_owner=$(echo -n "$(params.repository_owner)" | sed 's/ /%20/g')
+              repo_name=$(echo -n "$(params.repository_name)" | sed 's/ /%20/g')
+              read -r -d '' ca_cert_data << EOM
+              $(params.ca_cert_data)
+              EOM
+
+              echo | gnutls-cli $hostname --verify-hostname $hostname &> /dev/null
+              if [[ $? -ne 0 ]]; then
+
+                if [[ -z "$ca_cert_data" ]]; then
+                  >&2 echo "unable to verify certificate on git server, please verify ca_cert_data is set"
+                else
+                  echo | gnutls-cli --x509cafile=<(echo "$ca_cert_data") $hostname --verify-hostname $hostname &> /dev/null
+
+                  if [[ $? -ne 0 ]]; then
+                    >&2 echo "unable to verify git server's tls certificate against either system trust store or provided ca_cert_data"
+                  else
+                    CA_CERT_PATH=$(mktemp -d)
+                    echo "$(params.ca_cert_data)" | tee -a ${CA_CERT_PATH}/shared_custom_ca.crt > /dev/null
+                    git config --global http.sslCAinfo ${CA_CERT_PATH}/shared_custom_ca.crt
+                    export SSL_CERT_FILE=${CA_CERT_PATH}/shared_custom_ca.crt
+                  fi
+                fi
+              fi
+
+              set -o errexit
+              set -o pipefail
+
+              cd `mktemp -d`
+
+              head_branch=$(cat /workspaces/ws/commit_branch | tr -d '\n')
+
+              token=$(scm token --path $(credentials.path)/.git-credentials --host $(params.git_server_address) --owner "$repo_owner" --repo "$repo_name" --kind $(params.git_server_kind))
+
+              jx-scm pull-request create \
+                --kind "$(params.git_server_kind)" \
+                --server "$(params.git_server_address)" \
+                --token "$token" \
+                --owner "$repo_owner" \
+                --name "$repo_name" \
+                --head "$head_branch" \
+                --title "$(params.pull_request_title)" \
+                --body "$(params.pull_request_body)" \
+                --base "$(params.base_branch)" \
+                --allow-update 2>&1 |
+              tee stdoutAndSterr.txt
+
+              cat stdoutAndSterr.txt | sed -n -e 's/^.*\. url: //p' > $(results.pr-url.path)
+
